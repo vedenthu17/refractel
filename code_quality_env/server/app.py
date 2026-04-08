@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from pydantic import BaseModel
 
 from ..models import CodeReviewAction, CodeReviewStepResult
@@ -31,8 +31,8 @@ def tasks() -> dict:
 
 
 @app.post("/reset", response_model=CodeReviewStepResult)
-def reset(req: ResetRequest) -> CodeReviewStepResult:
-    return env.reset(task_name=req.task_name)
+def reset(req: ResetRequest | None = Body(default=None)) -> CodeReviewStepResult:
+    return env.reset(task_name=req.task_name if req else None)
 
 
 @app.post("/step", response_model=CodeReviewStepResult)
