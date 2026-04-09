@@ -15,6 +15,14 @@ class GradeResult:
     false_positives: int
 
 
+_SCORE_EPSILON = 1e-6
+
+
+def _clamp_open_unit_interval(value: float) -> float:
+    """Clamp score to the open interval (0, 1)."""
+    return max(_SCORE_EPSILON, min(1.0 - _SCORE_EPSILON, value))
+
+
 def _keyword_overlap_fraction(gt: GroundTruthFinding, pred: ReviewFinding) -> float:
     if not gt.must_include_keywords:
         return 1.0
@@ -79,7 +87,7 @@ def grade_task(task: TaskSpec, predictions: list[ReviewFinding]) -> GradeResult:
         f1 = 2 * precision * recall / (precision + recall)
 
     penalty = min(false_positives * 0.05, 0.4)
-    score = max(0.0, min(1.0, f1 - penalty))
+    score = _clamp_open_unit_interval(f1 - penalty)
 
     return GradeResult(
         score=score,

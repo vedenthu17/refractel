@@ -36,6 +36,12 @@ TASKS = [
     "hard_service_refactor_review",
 ]
 
+SCORE_EPSILON = 1e-6
+
+
+def clamp_open_unit_interval(value: float) -> float:
+    return max(SCORE_EPSILON, min(1.0 - SCORE_EPSILON, value))
+
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -250,8 +256,8 @@ async def run_task(task_name: str, client: OpenAI, env: CodeReviewEnv) -> float:
                 break
 
         st = await env.state()
-        score = float(st.get("score", 0.0))
-        score = max(0.0, min(1.0, score))
+        score = float(st.get("score", SCORE_EPSILON))
+        score = clamp_open_unit_interval(score)
         success = score >= 0.5
 
     finally:
@@ -279,7 +285,7 @@ async def main() -> None:
                     s = await run_task(task, client, env)
                 except Exception as task_exc:
                     print(f"[DEBUG] task {task} failed: {task_exc}", flush=True)
-                    s = 0.0
+                    s = SCORE_EPSILON
                 scores.append(s)
     except Exception as env_exc:
         print(f"[DEBUG] environment session failed: {env_exc}", flush=True)
