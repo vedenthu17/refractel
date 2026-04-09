@@ -18,6 +18,7 @@ class GradeResult:
 _SCORE_EPSILON = 1e-6
 
 
+
 def _clamp_open_unit_interval(value: float) -> float:
     """Clamp score to the open interval (0, 1)."""
     return max(_SCORE_EPSILON, min(1.0 - _SCORE_EPSILON, value))

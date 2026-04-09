@@ -18,6 +18,8 @@ class FindingType(str, Enum):
     LOGGING = "logging"
     COMMENTS = "comments"
 
+    
+
 
 class Severity(str, Enum):
     LOW = "low"

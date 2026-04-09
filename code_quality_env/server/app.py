@@ -14,7 +14,6 @@ class ResetRequest(BaseModel):
 env = CodeReviewEnvironment()
 app = FastAPI(title="Code Review Quality Environment", version="0.1.0")
 
-
 @app.get("/")
 def root() -> dict:
     return {"name": "code-review-quality-env", "status": "ok", "tasks": env.tasks}
