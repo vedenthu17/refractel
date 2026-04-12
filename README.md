@@ -173,13 +173,13 @@ Required file: root `inference.py` (included).
 Mandatory env vars:
 - `API_BASE_URL`
 - `MODEL_NAME`
-- `HF_TOKEN`
+- `API_KEY`
 - `LOCAL_IMAGE_NAME` (for local docker inference mode)
 
 Run baseline:
 
 ```bash
-HF_TOKEN=<token> \
+API_KEY=<token> \
 API_BASE_URL=https://router.huggingface.co/v1 \
 MODEL_NAME=Qwen/Qwen2.5-72B-Instruct \
 LOCAL_IMAGE_NAME=code-review-quality-env:latest \
@@ -212,7 +212,7 @@ openenv validate
 
 4. Run baseline inference end-to-end:
 ```bash
-HF_TOKEN=<token> API_BASE_URL=<endpoint> MODEL_NAME=<model> LOCAL_IMAGE_NAME=code-review-quality-env:latest python inference.py
+API_KEY=<token> API_BASE_URL=<endpoint> MODEL_NAME=<model> LOCAL_IMAGE_NAME=code-review-quality-env:latest python inference.py
 ```
 
 5. Deploy Docker Space on HF and verify `/reset` returns `200`.
