@@ -436,16 +436,17 @@ async def run_task(task_name: str, client: OpenAI, env: CodeReviewEnv) -> float:
             if result.done:
                 break
 
+            # Always attempt an LLM decision first so every run routes calls through the proxy.
+            action = get_llm_action(client=client, task=task_name, obs=obs, step=step, history=history)
+
             guided = _guided_action(task=task_name, obs=obs, step=step, submitted_plan_ids=submitted_plan_ids)
-            if guided is not None:
+            if action.action_type == ActionType.NOOP and guided is not None:
                 action = guided
-            elif step >= 8 and no_progress_steps >= 5:
+            elif action.action_type == ActionType.NOOP and step >= 8 and no_progress_steps >= 5:
                 action = CodeReviewAction(
                     action_type=ActionType.SUBMIT_REVIEW,
                     summary="readability logging comments review completed with prioritized findings",
                 )
-            else:
-                action = get_llm_action(client=client, task=task_name, obs=obs, step=step, history=history)
 
             # Ensure the agent inspects at least one file before submitting findings.
             if obs.get("open_file") is None and action.action_type in {ActionType.ADD_FINDING, ActionType.SUBMIT_REVIEW}:
