@@ -16,6 +16,14 @@ A real-world OpenEnv environment for training and evaluating agents on **code re
 
 This is not a toy environment. It simulates a practical workflow software teams run daily during pull-request review.
 
+## Hackathon-Grade Advanced Features
+
+- Semantic weighted grading with multi-factor similarity.
+- Optimal bipartite assignment between predicted and ground-truth findings.
+- Risk-hotspot mining from code complexity and failure-path patterns.
+- Confidence-calibrated final reward and richer environment telemetry.
+- Adaptive inference policy with deterministic hard-task plans and UCB-style exploration.
+
 ## Why This Environment Is Useful
 
 Human reviewers repeatedly catch:
@@ -41,6 +49,7 @@ Server endpoints:
 - `POST /step` -> observation, reward, done, info
 - `GET /state` -> full current episode state
 - `GET /tasks` -> task list
+- `GET /metrics/leaderboard` -> judge-facing benchmark snapshot (oracle vs sparse baseline)
 - `GET /health` -> liveness
 
 Typed Pydantic models:
@@ -74,8 +83,13 @@ Manifest:
 - `visible_files`
 - optional `open_file` and `open_file_content`
 - progress counters: findings submitted, matched findings, partial matches, false positives
+- `risk_hotspot_details` with per-line risk score
+- `recommendation_hints` for strategic action selection
 - `last_action_result`
 - optional `done_reason`
+
+`CodeReviewState` includes:
+- calibrated `confidence` in `[0.0, 1.0]`
 
 ## Task Set (Easy -> Hard)
 
@@ -91,6 +105,14 @@ Manifest:
 - Multi-step service/report generation path.
 - Objective: identify subtle readability refactor opportunities, TODO quality issues, and missing write-time logs.
 
+4. `hard_incident_postmortem_review` (hard)
+- Production incident recovery + retry + alert modules.
+- Objective: detect weak observability, poor variable naming, and insufficient policy documentation.
+
+5. `hard_distributed_checkout_review` (hard)
+- Distributed checkout orchestrator + outbox + billing path.
+- Objective: catch idempotency-risk comments, missing failure-path logs, and validation/readability problems.
+
 All tasks have deterministic graders with score in `[0.0, 1.0]`.
 
 ## Reward Function
@@ -99,10 +121,16 @@ Per-step shaped reward:
 - `inspect_file` on new file: positive reward.
 - `add_finding` exact GT match: strong reward.
 - partial GT match: medium reward.
+- hotspot-aligned finding bonus when a finding targets high-risk lines.
 - false positives / duplicates / invalid actions / noop loops: penalties.
-- `submit_review`: final reward from deterministic grader + small summary coverage bonus.
+- `submit_review`: final reward from deterministic grader + summary coverage + confidence bonus.
 
 State score is always clamped to `[0.0, 1.0]`.
+
+Grader internals:
+- Match score combines keyword overlap, line-distance decay, semantic token overlap, and severity alignment.
+- Matching uses maximum-weight bipartite assignment for global optimality.
+- Final score combines weighted F1/recall with bounded false-positive penalties.
 
 ## Project Structure
 
@@ -113,7 +141,7 @@ State score is always clamped to `[0.0, 1.0]`.
 - `code_quality_env/server/app.py` - FastAPI app
 - `code_quality_env/client.py` - async client and local Docker launcher
 - `openenv.yaml` - environment manifest
-- `inference.py` - required baseline script with strict `[START] [STEP] [END]` stdout logs
+- `inference.py` - advanced baseline policy with strict `[START] [STEP] [END]` stdout logs
 
 ## Setup
 
@@ -151,6 +179,12 @@ Health check:
 
 ```bash
 curl http://127.0.0.1:7860/health
+```
+
+Leaderboard metrics snapshot:
+
+```bash
+curl http://127.0.0.1:7860/metrics/leaderboard
 ```
 
 ## Hugging Face Space Deployment (Docker)
@@ -192,6 +226,25 @@ The script emits strict logs:
 - `[END] ...`
 
 and reports reproducible per-task scores in `[0,1]` (temperature fixed to `0.0`).
+
+Policy highlights in `inference.py`:
+- deterministic task-specific finding plans for hard tasks,
+- heuristic mining of candidate findings from open file content,
+- candidate reranking with risk-hotspot alignment,
+- adaptive exploration bonus (UCB-style) over action families.
+
+## Local Dry-Run Scoring (No External LLM Needed)
+
+Run a deterministic benchmark snapshot directly from Python:
+
+```bash
+python -c "from code_quality_env.server.metrics import build_leaderboard_snapshot; import json; print(json.dumps(build_leaderboard_snapshot(), indent=2))"
+```
+
+This produces per-task and aggregate scores for:
+- `oracle` predictions (upper-bound quality),
+- `sparse_baseline` predictions (lower-bound quality),
+- averaged benchmark summary for quick judge demos.
 
 ## Pre-Submission Steps To Pass Initial Requirements
 

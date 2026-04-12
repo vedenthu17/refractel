@@ -4,6 +4,7 @@ from fastapi import Body, FastAPI
 from pydantic import BaseModel
 
 from ..models import CodeReviewAction, CodeReviewStepResult
+from .metrics import build_leaderboard_snapshot
 from .review_environment import CodeReviewEnvironment
 
 
@@ -27,6 +28,11 @@ def health() -> dict:
 @app.get("/tasks")
 def tasks() -> dict:
     return {"tasks": env.tasks}
+
+
+@app.get("/metrics/leaderboard")
+def metrics_leaderboard() -> dict:
+    return build_leaderboard_snapshot()
 
 
 @app.post("/reset", response_model=CodeReviewStepResult)

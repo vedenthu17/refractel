@@ -14,6 +14,7 @@ import asyncio
 import re
 import os
 import textwrap
+import math
 from typing import List, Optional
 
 from openai import OpenAI
@@ -35,6 +36,8 @@ TASKS = [
     "easy_api_logging_review",
     "medium_batch_job_review",
     "hard_service_refactor_review",
+    "hard_incident_postmortem_review",
+    "hard_distributed_checkout_review",
 ]
 
 # Keep a display-safe margin from 0 and 1 so score logs and validators
@@ -256,7 +259,144 @@ TASK_FINDING_PLANS: dict[str, list[dict[str, object]]] = {
             "suggestion": "Add a docstring describing supported currency values and format.",
         },
     ],
+    "hard_incident_postmortem_review": [
+        {
+            "id": "post-1",
+            "file_path": "incident/recovery.py",
+            "line": 1,
+            "finding_type": FindingType.COMMENTS,
+            "severity": Severity.MEDIUM,
+            "issue": "Missing docstring for recovery workflow makes postmortem review harder.",
+            "suggestion": "Add recovery docstring describing inputs, state transitions, and outputs.",
+        },
+        {
+            "id": "post-2",
+            "file_path": "incident/recovery.py",
+            "line": 19,
+            "finding_type": FindingType.LOGGING,
+            "severity": Severity.HIGH,
+            "issue": "State write path lacks logger event and weakens incident diagnostics.",
+            "suggestion": "Add logger write event with service count and severity context.",
+        },
+        {
+            "id": "post-3",
+            "file_path": "incident/recovery.py",
+            "line": 2,
+            "finding_type": FindingType.READABILITY,
+            "severity": Severity.MEDIUM,
+            "issue": "Variable out is vague; use descriptive naming for maintainability.",
+            "suggestion": "Rename out to a descriptive domain variable for recovered incidents.",
+        },
+        {
+            "id": "post-4",
+            "file_path": "incident/recovery.py",
+            "line": 14,
+            "finding_type": FindingType.READABILITY,
+            "severity": Severity.MEDIUM,
+            "issue": "Score threshold logic should use named constant values.",
+            "suggestion": "Extract score thresholds and weights into named constants.",
+        },
+        {
+            "id": "post-5",
+            "file_path": "incident/retry.py",
+            "line": 1,
+            "finding_type": FindingType.COMMENTS,
+            "severity": Severity.LOW,
+            "issue": "Backoff helper lacks docstring for retry semantics.",
+            "suggestion": "Add backoff docstring documenting exponential behavior and cap.",
+        },
+        {
+            "id": "post-6",
+            "file_path": "incident/alerts.py",
+            "line": 1,
+            "finding_type": FindingType.LOGGING,
+            "severity": Severity.MEDIUM,
+            "issue": "Alert payload is not clearly structured with explicit fields.",
+            "suggestion": "Use structured fields with explicit names for observability.",
+        },
+    ],
+    "hard_distributed_checkout_review": [
+        {
+            "id": "dist-1",
+            "file_path": "checkout/orchestrator.py",
+            "line": 1,
+            "finding_type": FindingType.COMMENTS,
+            "severity": Severity.MEDIUM,
+            "issue": "Orchestrator function has no docstring describing checkout flow.",
+            "suggestion": "Add checkout docstring with failure paths and side effects.",
+        },
+        {
+            "id": "dist-2",
+            "file_path": "checkout/orchestrator.py",
+            "line": 3,
+            "finding_type": FindingType.LOGGING,
+            "severity": Severity.HIGH,
+            "issue": "Missing logger signal for invalid request_id branch.",
+            "suggestion": "Add logger event with request_id validation outcome.",
+        },
+        {
+            "id": "dist-3",
+            "file_path": "checkout/orchestrator.py",
+            "line": 17,
+            "finding_type": FindingType.LOGGING,
+            "severity": Severity.HIGH,
+            "issue": "Payment failure rollback path has no logger evidence.",
+            "suggestion": "Log payment_failed branch with user and request context.",
+        },
+        {
+            "id": "dist-4",
+            "file_path": "checkout/outbox.py",
+            "line": 3,
+            "finding_type": FindingType.LOGGING,
+            "severity": Severity.HIGH,
+            "issue": "Publish operation is unlogged and can hide message loss issues.",
+            "suggestion": "Add structured logger events around publish successes/failures.",
+        },
+        {
+            "id": "dist-5",
+            "file_path": "checkout/outbox.py",
+            "line": 1,
+            "finding_type": FindingType.COMMENTS,
+            "severity": Severity.LOW,
+            "issue": "Outbox flush behavior lacks a function docstring.",
+            "suggestion": "Add outbox docstring for durability and retry assumptions.",
+        },
+        {
+            "id": "dist-6",
+            "file_path": "checkout/billing.py",
+            "line": 2,
+            "finding_type": FindingType.COMMENTS,
+            "severity": Severity.MEDIUM,
+            "issue": "Todo comment does not reference tracked issue ownership.",
+            "suggestion": "Link todo to a tracked issue and intended resolution plan.",
+        },
+        {
+            "id": "dist-7",
+            "file_path": "checkout/billing.py",
+            "line": 3,
+            "finding_type": FindingType.READABILITY,
+            "severity": Severity.MEDIUM,
+            "issue": "Input validation should be extracted into a reusable validate helper.",
+            "suggestion": "Create a validate helper for charge request preconditions.",
+        },
+    ],
 }
+
+
+def _action_family(action: CodeReviewAction) -> str:
+    if action.action_type == ActionType.ADD_FINDING and action.finding is not None:
+        return f"finding:{action.finding.finding_type.value}"
+    return action.action_type.value
+
+
+def _bandit_bonus(action: CodeReviewAction, action_stats: dict[str, tuple[int, float]], total_decisions: int) -> float:
+    family = _action_family(action)
+    pulls, reward_sum = action_stats.get(family, (0, 0.0))
+    if pulls == 0:
+        return 0.35
+    mean_reward = reward_sum / pulls
+    explore = math.sqrt((2.0 * math.log(max(total_decisions, 1) + 1)) / pulls)
+    return (0.18 * mean_reward) + (0.08 * explore)
 
 
 def _guided_action(task: str, obs: dict, step: int, submitted_plan_ids: set[str]) -> CodeReviewAction | None:
@@ -448,6 +588,8 @@ def _score_action_candidate(
     seen_finding_keys: set[tuple[str, int, str, str]],
     seen_finding_coords: set[tuple[str, int, str]],
     no_progress_steps: int,
+    action_stats: dict[str, tuple[int, float]],
+    total_decisions: int,
 ) -> float:
     focus_coverage = obs.get("focus_coverage") or {}
     risk_hotspots = _parse_risk_hotspots(obs)
@@ -463,7 +605,7 @@ def _score_action_candidate(
             score += 0.50
         if action.file_path != obs.get("open_file"):
             score += 0.20
-        return score
+        return score + _bandit_bonus(action, action_stats, total_decisions)
 
     if action.action_type == ActionType.SUBMIT_REVIEW:
         score = -0.30
@@ -477,7 +619,7 @@ def _score_action_candidate(
             score += 0.25
         missing_focus = sum(1 for v in focus_coverage.values() if int(v) <= 0)
         score -= 0.25 * missing_focus
-        return score
+        return score + _bandit_bonus(action, action_stats, total_decisions)
 
     if action.action_type == ActionType.ADD_FINDING and action.finding is not None:
         finding = action.finding
@@ -503,7 +645,7 @@ def _score_action_candidate(
         if step <= 2 and int(obs.get("findings_submitted", 0)) == 0 and obs.get("open_file") is None:
             score -= 0.50
 
-        return score
+        return score + _bandit_bonus(action, action_stats, total_decisions)
 
     return -1.0
 
@@ -517,6 +659,8 @@ def _choose_advanced_action(
     seen_finding_keys: set[tuple[str, int, str, str]],
     seen_finding_coords: set[tuple[str, int, str]],
     no_progress_steps: int,
+    action_stats: dict[str, tuple[int, float]],
+    total_decisions: int,
 ) -> CodeReviewAction:
     candidates: list[CodeReviewAction] = [llm_action]
 
@@ -551,6 +695,8 @@ def _choose_advanced_action(
                 seen_finding_keys=seen_finding_keys,
                 seen_finding_coords=seen_finding_coords,
                 no_progress_steps=no_progress_steps,
+                action_stats=action_stats,
+                total_decisions=total_decisions,
             ),
             c,
         )
@@ -696,6 +842,8 @@ async def run_task(task_name: str, client: OpenAI, env: CodeReviewEnv) -> float:
     submitted_plan_ids: set[str] = set()
     no_progress_steps = 0
     last_progress = 0
+    action_stats: dict[str, tuple[int, float]] = {}
+    total_decisions = 0
 
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
     try:
@@ -717,6 +865,8 @@ async def run_task(task_name: str, client: OpenAI, env: CodeReviewEnv) -> float:
                 seen_finding_keys=seen_finding_keys,
                 seen_finding_coords=seen_finding_coords,
                 no_progress_steps=no_progress_steps,
+                action_stats=action_stats,
+                total_decisions=total_decisions,
             )
 
             # Ensure the agent inspects at least one file before submitting findings.
@@ -752,6 +902,7 @@ async def run_task(task_name: str, client: OpenAI, env: CodeReviewEnv) -> float:
             rewards.append(reward)
             steps_taken = step
             obs = result.observation.model_dump()
+            total_decisions += 1
 
             action_str = _safe_text(action.model_dump_json())
             err = result.info.get("error") if isinstance(result.info, dict) else None
@@ -773,6 +924,10 @@ async def run_task(task_name: str, client: OpenAI, env: CodeReviewEnv) -> float:
                         ):
                             submitted_plan_ids.add(str(item["id"]))
                             break
+
+            family = _action_family(action)
+            pulls, reward_sum = action_stats.get(family, (0, 0.0))
+            action_stats[family] = (pulls + 1, reward_sum + reward)
 
             progress = int(obs.get("matched_findings", 0)) + int(obs.get("partial_matches", 0))
             if progress > last_progress:

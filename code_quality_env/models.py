@@ -65,6 +65,8 @@ class CodeReviewObservation(BaseModel):
     open_file_content: Optional[str] = None
     focus_coverage: Dict[str, int] = Field(default_factory=dict)
     risk_hotspots: List[str] = Field(default_factory=list)
+    risk_hotspot_details: Dict[str, float] = Field(default_factory=dict)
+    recommendation_hints: List[str] = Field(default_factory=list)
     findings_submitted: int
     matched_findings: int
     partial_matches: int
@@ -88,6 +90,7 @@ class CodeReviewState(BaseModel):
     findings: List[ReviewFinding]
     matched_gt_ids: List[str]
     partial_gt_ids: List[str]
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
 class CodeReviewStepResult(BaseModel):

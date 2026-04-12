@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+import re
 from typing import Dict, Optional
 
 from ..graders import grade_task, match_finding
@@ -34,6 +35,8 @@ class RuntimeState:
     last_action_result: str = "Environment reset."
     invalid_actions: int = 0
     noop_streak: int = 0
+    risk_hotspot_details: Dict[str, float] = field(default_factory=dict)
+    recommendation_hints: list[str] = field(default_factory=list)
 
 
 class CodeReviewEnvironment:
@@ -52,12 +55,15 @@ class CodeReviewEnvironment:
         if selected not in self._tasks:
             selected = self._task_order[0]
         self._runtime = RuntimeState(task=self._tasks[selected])
+        self._runtime.risk_hotspot_details = self._compute_risk_hotspot_details(self._runtime.task)
+        self._runtime.recommendation_hints = self._build_recommendation_hints(self._runtime.task)
         obs = self._observation()
         return CodeReviewStepResult(observation=obs, reward=0.0, done=False, info={"task_name": selected})
 
     def state(self) -> CodeReviewState:
         runtime = self._require_runtime()
         grade = grade_task(runtime.task, runtime.findings)
+        confidence = self._calibrated_confidence(runtime)
         return CodeReviewState(
             episode_id=runtime.episode_id,
             task_name=runtime.task.name,
@@ -73,6 +79,7 @@ class CodeReviewEnvironment:
             findings=runtime.findings,
             matched_gt_ids=sorted(runtime.matched_gt_ids),
             partial_gt_ids=sorted(runtime.partial_gt_ids),
+            confidence=confidence,
         )
 
     def step(self, action: CodeReviewAction) -> CodeReviewStepResult:
@@ -134,8 +141,14 @@ class CodeReviewEnvironment:
 
         runtime.inspected_files.add(target)
         multi_file_bonus = 0.02 if len(runtime.inspected_files) >= 2 else 0.0
+        hotspot_bonus = 0.0
+        prefix = f"{target}:"
+        for key, score in runtime.risk_hotspot_details.items():
+            if key.startswith(prefix) and score >= 0.72:
+                hotspot_bonus = 0.01
+                break
         runtime.last_action_result = f"Opened file {target}."
-        return min(0.08, 0.04 + multi_file_bonus), {"file": target, "repeat": False}
+        return min(0.09, 0.04 + multi_file_bonus + hotspot_bonus), {"file": target, "repeat": False}
 
     def _handle_add_finding(self, runtime: RuntimeState, action: CodeReviewAction) -> tuple[float, dict]:
         if action.finding is None:
@@ -195,13 +208,23 @@ class CodeReviewEnvironment:
             runtime.covered_focus_types.add(matched_focus)
             coverage_bonus = 0.03
 
+        hotspot_alignment_bonus = 0.0
+        hotspot_key = f"{finding.file_path}:{finding.line}"
+        hotspot_score = runtime.risk_hotspot_details.get(hotspot_key, 0.0)
+        if hotspot_score >= 0.72:
+            hotspot_alignment_bonus = 0.02
+
         if best_status == "false_positive":
             runtime.penalties += 0.02
             if len(runtime.findings) > 4:
                 runtime.penalties += 0.02
 
         runtime.last_action_result = f"Finding accepted: {best_status}."
-        return min(1.0, best_reward + coverage_bonus), {"match_status": best_status, "match_id": matched_id}
+        return min(1.0, best_reward + coverage_bonus + hotspot_alignment_bonus), {
+            "match_status": best_status,
+            "match_id": matched_id,
+            "hotspot_alignment": hotspot_score,
+        }
 
     def _handle_submit(self, runtime: RuntimeState, action: CodeReviewAction) -> tuple[float, dict]:
         grade = grade_task(runtime.task, runtime.findings)
@@ -222,19 +245,24 @@ class CodeReviewEnvironment:
         if len(runtime.inspected_files) < min_inspected:
             early_submit_penalty += 0.08
 
+        confidence = self._calibrated_confidence(runtime)
+        confidence_bonus = 0.06 * confidence
+
         runtime.done = True
         runtime.done_reason = "submitted"
         runtime.last_action_result = "Review submitted."
 
-        final_reward = max(0.0, min(1.0, grade.score + summary_bonus - early_submit_penalty))
+        final_reward = max(0.0, min(1.0, grade.score + summary_bonus + confidence_bonus - early_submit_penalty))
         return final_reward, {
             "final_score": grade.score,
             "early_submit_penalty": early_submit_penalty,
+            "confidence": confidence,
             "precision": grade.precision,
             "recall": grade.recall,
             "exact_matches": grade.exact_matches,
             "partial_matches": grade.partial_matches,
             "false_positives": grade.false_positives,
+            "mean_match_score": grade.mean_match_score,
         }
 
     def _observation(self) -> CodeReviewObservation:
@@ -253,7 +281,9 @@ class CodeReviewEnvironment:
                 focus.value: sum(1 for f in runtime.findings if f.finding_type == focus)
                 for focus in runtime.task.objective.required_focus
             },
-            risk_hotspots=[f"{gt.file_path}:{gt.line}" for gt in runtime.task.ground_truth[:3]],
+            risk_hotspots=sorted(runtime.risk_hotspot_details.keys(), key=lambda k: runtime.risk_hotspot_details[k], reverse=True)[:6],
+            risk_hotspot_details=runtime.risk_hotspot_details,
+            recommendation_hints=runtime.recommendation_hints,
             findings_submitted=len(runtime.findings),
             matched_findings=len(runtime.matched_gt_ids),
             partial_matches=len(runtime.partial_gt_ids),
@@ -261,6 +291,50 @@ class CodeReviewEnvironment:
             last_action_result=runtime.last_action_result,
             done_reason=runtime.done_reason,
         )
+
+    def _compute_risk_hotspot_details(self, task: TaskSpec) -> Dict[str, float]:
+        details: Dict[str, float] = {}
+        gt_keys = {(gt.file_path, gt.line) for gt in task.ground_truth}
+        for file_snapshot in task.files:
+            lines = file_snapshot.content.splitlines()
+            for idx, line in enumerate(lines, start=1):
+                risk = 0.0
+                lower = line.lower()
+
+                if (file_snapshot.file_path, idx) in gt_keys:
+                    risk += 0.45
+                if "todo" in lower or "fixme" in lower:
+                    risk += 0.20
+                if re.search(r"\bpass\b", lower):
+                    risk += 0.20
+                if "write(" in lower or "write_many(" in lower:
+                    risk += 0.12
+                if re.search(r"==\s*none|!=\s*none", lower):
+                    risk += 0.10
+                if lower.count("if ") + lower.count(" and ") + lower.count(" or ") >= 2:
+                    risk += 0.08
+
+                if risk >= 0.38:
+                    details[f"{file_snapshot.file_path}:{idx}"] = min(1.0, risk)
+
+        return details
+
+    def _build_recommendation_hints(self, task: TaskSpec) -> list[str]:
+        file_count = len(task.files)
+        return [
+            f"Inspect at least {max(1, file_count // 2)} files before submit.",
+            "Cover all required focus areas: readability, logging, comments.",
+            "Prioritize findings near high-risk hotspot lines first.",
+        ]
+
+    def _calibrated_confidence(self, runtime: RuntimeState) -> float:
+        grade = grade_task(runtime.task, runtime.findings)
+        focus_count = len(runtime.task.objective.required_focus)
+        covered = len(runtime.covered_focus_types)
+        focus_ratio = covered / max(focus_count, 1)
+        inspect_ratio = len(runtime.inspected_files) / max(len(runtime.task.files), 1)
+        confidence = (0.45 * grade.precision) + (0.35 * grade.recall) + (0.12 * focus_ratio) + (0.08 * inspect_ratio)
+        return max(0.0, min(1.0, confidence))
 
     def _require_runtime(self) -> RuntimeState:
         if self._runtime is None:

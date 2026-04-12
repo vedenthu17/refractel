@@ -329,4 +329,125 @@ def build_tasks() -> list[TaskSpec]:
                 ),
             ],
         ),
+        TaskSpec(
+            name="hard_distributed_checkout_review",
+            difficulty="hard",
+            objective=TaskObjective(
+                goal="Review a distributed checkout workflow and catch subtle idempotency, observability, and readability defects across orchestrator, queue, and billing modules.",
+                required_focus=[FindingType.READABILITY, FindingType.LOGGING, FindingType.COMMENTS],
+                max_steps=32,
+            ),
+            files=[
+                FileSnapshot(
+                    file_path="checkout/orchestrator.py",
+                    content="""def process_checkout(cmd, inventory, billing, outbox, logger, now):
+    req_id = cmd.get('request_id')
+    if req_id is None:
+        return {'ok': False, 'err': 'missing_request_id'}
+    items = cmd.get('items', [])
+    reserved = []
+    for it in items:
+        sku = it.get('sku')
+        qty = int(it.get('qty', 1))
+        if qty <= 0:
+            continue
+        if not inventory.reserve(sku, qty):
+            for s, q in reserved:
+                inventory.release(s, q)
+            return {'ok': False, 'err': 'no_stock', 'sku': sku}
+        reserved.append((sku, qty))
+
+    charge = billing.charge(cmd.get('user_id'), cmd.get('payment_token'), cmd.get('total'))
+    if not charge.get('ok'):
+        for s, q in reserved:
+            inventory.release(s, q)
+        return {'ok': False, 'err': 'payment_failed'}
+
+    outbox.append({'type': 'OrderPlaced', 'request_id': req_id, 'ts': now, 'items': items})
+    return {'ok': True, 'charge_id': charge.get('id')}
+""",
+                ),
+                FileSnapshot(
+                    file_path="checkout/outbox.py",
+                    content="""def flush_outbox(outbox, publisher, logger):
+    sent = 0
+    for e in outbox:
+        publisher.publish(e)
+        sent += 1
+    outbox.clear()
+    return sent
+""",
+                ),
+                FileSnapshot(
+                    file_path="checkout/billing.py",
+                    content="""def charge(user_id, token, total, gateway, logger):
+    # TODO dedupe by request key later
+    if total is None:
+        return {'ok': False, 'err': 'missing_total'}
+    resp = gateway.pay(token, float(total))
+    if not resp.get('accepted'):
+        return {'ok': False, 'err': 'declined'}
+    return {'ok': True, 'id': resp.get('id')}
+""",
+                ),
+            ],
+            ground_truth=[
+                GroundTruthFinding(
+                    finding_id="dist-1",
+                    file_path="checkout/orchestrator.py",
+                    line=1,
+                    finding_type=FindingType.COMMENTS,
+                    severity=Severity.MEDIUM,
+                    must_include_keywords=["docstring", "checkout"],
+                ),
+                GroundTruthFinding(
+                    finding_id="dist-2",
+                    file_path="checkout/orchestrator.py",
+                    line=3,
+                    finding_type=FindingType.LOGGING,
+                    severity=Severity.HIGH,
+                    must_include_keywords=["logger", "request_id"],
+                ),
+                GroundTruthFinding(
+                    finding_id="dist-3",
+                    file_path="checkout/orchestrator.py",
+                    line=17,
+                    finding_type=FindingType.LOGGING,
+                    severity=Severity.HIGH,
+                    must_include_keywords=["logger", "payment_failed"],
+                ),
+                GroundTruthFinding(
+                    finding_id="dist-4",
+                    file_path="checkout/outbox.py",
+                    line=3,
+                    finding_type=FindingType.LOGGING,
+                    severity=Severity.HIGH,
+                    must_include_keywords=["publish", "logger"],
+                ),
+                GroundTruthFinding(
+                    finding_id="dist-5",
+                    file_path="checkout/outbox.py",
+                    line=1,
+                    finding_type=FindingType.COMMENTS,
+                    severity=Severity.LOW,
+                    must_include_keywords=["docstring", "outbox"],
+                ),
+                GroundTruthFinding(
+                    finding_id="dist-6",
+                    file_path="checkout/billing.py",
+                    line=2,
+                    finding_type=FindingType.COMMENTS,
+                    severity=Severity.MEDIUM,
+                    must_include_keywords=["todo", "tracked issue"],
+                ),
+                GroundTruthFinding(
+                    finding_id="dist-7",
+                    file_path="checkout/billing.py",
+                    line=3,
+                    finding_type=FindingType.READABILITY,
+                    severity=Severity.MEDIUM,
+                    must_include_keywords=["validate", "helper"],
+                ),
+            ],
+        ),
     ]
