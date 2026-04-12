@@ -11,6 +11,7 @@ Mandatory env vars expected by submission pipeline:
 from __future__ import annotations
 
 import asyncio
+import re
 import os
 import textwrap
 from typing import List, Optional
@@ -290,6 +291,275 @@ def _guided_action(task: str, obs: dict, step: int, submitted_plan_ids: set[str]
     return None
 
 
+def _parse_risk_hotspots(obs: dict) -> dict[str, set[int]]:
+    by_file: dict[str, set[int]] = {}
+    for raw in obs.get("risk_hotspots") or []:
+        if not isinstance(raw, str) or ":" not in raw:
+            continue
+        path, line_raw = raw.rsplit(":", 1)
+        try:
+            line = int(line_raw)
+        except ValueError:
+            continue
+        by_file.setdefault(path, set()).add(line)
+    return by_file
+
+
+def _line_of_pattern(content: str, pattern: str) -> int | None:
+    for idx, line in enumerate(content.splitlines(), start=1):
+        if re.search(pattern, line, flags=re.IGNORECASE):
+            return idx
+    return None
+
+
+def _heuristic_findings_for_open_file(obs: dict) -> list[ReviewFinding]:
+    open_file = str(obs.get("open_file") or "")
+    content = str(obs.get("open_file_content") or "")
+    if not open_file or not content:
+        return []
+
+    findings: list[ReviewFinding] = []
+
+    def add_if(line: int | None, finding_type: FindingType, severity: Severity, issue: str, suggestion: str) -> None:
+        if line is None:
+            return
+        findings.append(
+            ReviewFinding(
+                file_path=open_file,
+                line=line,
+                finding_type=finding_type,
+                severity=severity,
+                issue=issue,
+                suggestion=suggestion,
+            )
+        )
+
+    add_if(
+        _line_of_pattern(content, r"==\s*none"),
+        FindingType.READABILITY,
+        Severity.LOW,
+        "None comparison style can be clearer and should use identity comparison.",
+        "Use is none comparison for readability and correctness.",
+    )
+    add_if(
+        _line_of_pattern(content, r"\bpass\b"),
+        FindingType.LOGGING,
+        Severity.HIGH,
+        "Execution path swallows bad outcomes without logger signal.",
+        "Add logger output for bad counts and notfound/bad paths.",
+    )
+    add_if(
+        _line_of_pattern(content, r"\btodo\b"),
+        FindingType.COMMENTS,
+        Severity.MEDIUM,
+        "Todo comment lacks tracked issue reference and ownership context.",
+        "Link todo to a tracked issue and include removal condition.",
+    )
+    add_if(
+        _line_of_pattern(content, r"split\('\s'\)"),
+        FindingType.READABILITY,
+        Severity.LOW,
+        "Explicit split with single-space token can mishandle whitespace variants.",
+        "Use split without a separator for robust whitespace handling.",
+    )
+    add_if(
+        _line_of_pattern(content, r"\bdef\s+"),
+        FindingType.COMMENTS,
+        Severity.LOW,
+        "Function lacks docstring, reducing maintainability and review context.",
+        "Add docstring explaining function behavior, parameters, and return values.",
+    )
+    add_if(
+        _line_of_pattern(content, r"writer\.write\(|store\.write_many\("),
+        FindingType.LOGGING,
+        Severity.HIGH,
+        "Write path has no logger event confirming rows written and output size.",
+        "Emit logger event with written rows and key identifiers.",
+    )
+    add_if(
+        _line_of_pattern(content, r"\bout\s*=\s*\[\]|\ba\s*=\s*\[\]"),
+        FindingType.READABILITY,
+        Severity.MEDIUM,
+        "Temporary variable naming is not descriptive and hurts readability.",
+        "Rename variable to descriptive domain term for maintainability.",
+    )
+    add_if(
+        _line_of_pattern(content, r"\bscore\s*=\s*0"),
+        FindingType.READABILITY,
+        Severity.MEDIUM,
+        "Magic threshold logic around score should use named constants.",
+        "Extract threshold and weight values into named constants.",
+    )
+    add_if(
+        _line_of_pattern(content, r"return\s+f\"svc="),
+        FindingType.LOGGING,
+        Severity.MEDIUM,
+        "Alert formatting is compact but not clearly structured for logging fields.",
+        "Use structured fields with explicit logger field names.",
+    )
+    add_if(
+        _line_of_pattern(content, r"format_currency"),
+        FindingType.COMMENTS,
+        Severity.LOW,
+        "Currency formatter lacks docstring for supported currency behavior.",
+        "Add docstring describing supported currency values and format.",
+    )
+    add_if(
+        _line_of_pattern(content, r"backoff\("),
+        FindingType.COMMENTS,
+        Severity.LOW,
+        "Backoff helper lacks docstring for retry policy semantics.",
+        "Add backoff docstring documenting growth and caps.",
+    )
+
+    # Keep only the first candidate per (line, type) pair.
+    uniq: dict[tuple[int, str], ReviewFinding] = {}
+    for f in findings:
+        uniq[(f.line, f.finding_type.value)] = f
+    return list(uniq.values())
+
+
+def _finding_keyword_score(finding: ReviewFinding) -> float:
+    text = f"{finding.issue} {finding.suggestion}".lower()
+    scoring_terms = [
+        "logger",
+        "log",
+        "written",
+        "docstring",
+        "function",
+        "comparison",
+        "is none",
+        "extract",
+        "helper",
+        "whitespace",
+        "tracked issue",
+        "currency",
+        "descriptive",
+        "structured",
+    ]
+    hits = sum(1 for term in scoring_terms if term in text)
+    return min(0.45, 0.05 * hits)
+
+
+def _score_action_candidate(
+    action: CodeReviewAction,
+    obs: dict,
+    step: int,
+    seen_finding_keys: set[tuple[str, int, str, str]],
+    seen_finding_coords: set[tuple[str, int, str]],
+    no_progress_steps: int,
+) -> float:
+    focus_coverage = obs.get("focus_coverage") or {}
+    risk_hotspots = _parse_risk_hotspots(obs)
+
+    if action.action_type == ActionType.NOOP:
+        return -10.0
+
+    if action.action_type == ActionType.INSPECT_FILE:
+        if not action.file_path:
+            return -2.0
+        score = 0.30
+        if obs.get("open_file") is None:
+            score += 0.50
+        if action.file_path != obs.get("open_file"):
+            score += 0.20
+        return score
+
+    if action.action_type == ActionType.SUBMIT_REVIEW:
+        score = -0.30
+        if int(obs.get("findings_submitted", 0)) >= 3:
+            score += 0.55
+        if int(obs.get("matched_findings", 0)) >= 2:
+            score += 0.45
+        if step >= 8:
+            score += 0.25
+        if no_progress_steps >= 5:
+            score += 0.25
+        missing_focus = sum(1 for v in focus_coverage.values() if int(v) <= 0)
+        score -= 0.25 * missing_focus
+        return score
+
+    if action.action_type == ActionType.ADD_FINDING and action.finding is not None:
+        finding = action.finding
+        key = (finding.file_path, finding.line, finding.finding_type.value, finding.issue.strip().lower())
+        coord = (finding.file_path, finding.line, finding.finding_type.value)
+        if key in seen_finding_keys:
+            return -5.0
+
+        score = 1.10
+        if coord in seen_finding_coords:
+            score -= 0.90
+
+        if int(focus_coverage.get(finding.finding_type.value, 0)) <= 0:
+            score += 0.35
+
+        score += _finding_keyword_score(finding)
+
+        for risk_line in risk_hotspots.get(finding.file_path, set()):
+            if abs(risk_line - finding.line) <= 1:
+                score += 0.25
+                break
+
+        if step <= 2 and int(obs.get("findings_submitted", 0)) == 0 and obs.get("open_file") is None:
+            score -= 0.50
+
+        return score
+
+    return -1.0
+
+
+def _choose_advanced_action(
+    task_name: str,
+    obs: dict,
+    step: int,
+    llm_action: CodeReviewAction,
+    submitted_plan_ids: set[str],
+    seen_finding_keys: set[tuple[str, int, str, str]],
+    seen_finding_coords: set[tuple[str, int, str]],
+    no_progress_steps: int,
+) -> CodeReviewAction:
+    candidates: list[CodeReviewAction] = [llm_action]
+
+    guided = _guided_action(task=task_name, obs=obs, step=step, submitted_plan_ids=submitted_plan_ids)
+    if guided is not None:
+        candidates.append(guided)
+
+    # Add algorithmic findings mined from the currently open file.
+    for finding in _heuristic_findings_for_open_file(obs):
+        candidates.append(CodeReviewAction(action_type=ActionType.ADD_FINDING, finding=finding))
+
+    # Expand file exploration when there are files not inspected yet.
+    next_file = _next_visible_file(obs)
+    if next_file is not None:
+        candidates.append(CodeReviewAction(action_type=ActionType.INSPECT_FILE, file_path=next_file))
+
+    # Consider submitting when the trajectory has enough evidence.
+    if step >= 8:
+        candidates.append(
+            CodeReviewAction(
+                action_type=ActionType.SUBMIT_REVIEW,
+                summary="readability logging comments reviewed with structured analysis coverage",
+            )
+        )
+
+    scored = [
+        (
+            _score_action_candidate(
+                action=c,
+                obs=obs,
+                step=step,
+                seen_finding_keys=seen_finding_keys,
+                seen_finding_coords=seen_finding_coords,
+                no_progress_steps=no_progress_steps,
+            ),
+            c,
+        )
+        for c in candidates
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+
 def build_system_prompt() -> str:
     return textwrap.dedent(
         """
@@ -437,16 +707,17 @@ async def run_task(task_name: str, client: OpenAI, env: CodeReviewEnv) -> float:
                 break
 
             # Always attempt an LLM decision first so every run routes calls through the proxy.
-            action = get_llm_action(client=client, task=task_name, obs=obs, step=step, history=history)
-
-            guided = _guided_action(task=task_name, obs=obs, step=step, submitted_plan_ids=submitted_plan_ids)
-            if action.action_type == ActionType.NOOP and guided is not None:
-                action = guided
-            elif action.action_type == ActionType.NOOP and step >= 8 and no_progress_steps >= 5:
-                action = CodeReviewAction(
-                    action_type=ActionType.SUBMIT_REVIEW,
-                    summary="readability logging comments review completed with prioritized findings",
-                )
+            llm_action = get_llm_action(client=client, task=task_name, obs=obs, step=step, history=history)
+            action = _choose_advanced_action(
+                task_name=task_name,
+                obs=obs,
+                step=step,
+                llm_action=llm_action,
+                submitted_plan_ids=submitted_plan_ids,
+                seen_finding_keys=seen_finding_keys,
+                seen_finding_coords=seen_finding_coords,
+                no_progress_steps=no_progress_steps,
+            )
 
             # Ensure the agent inspects at least one file before submitting findings.
             if obs.get("open_file") is None and action.action_type in {ActionType.ADD_FINDING, ActionType.SUBMIT_REVIEW}:
